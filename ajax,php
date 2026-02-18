@@ -1,0 +1,1071 @@
+<?php
+define('NO_KEEP_STATISTIC', true);
+define('NO_AGENT_STATISTIC', true);
+define('PUBLIC_AJAX_MODE', true);
+
+require($_SERVER['DOCUMENT_ROOT'].'/bitrix/modules/main/include/prolog_before.php');
+
+use Bitrix\Main\Loader;
+use Bitrix\Main\Application;
+use Bitrix\Main\Web\Json;
+use Bitrix\UI\Form\EntityEditorConfiguration;
+use Bitrix\UI\Form\EntityEditorConfigScope;
+
+Loader::includeModule('main');
+Loader::includeModule('ui');
+Loader::includeModule('crm');
+Loader::includeModule('intranet');
+
+final class LinxysFilterFieldsAjax
+{
+    private static string $logFile;
+
+    // =========================================================
+    // Entry point
+    // =========================================================
+    public static function run(): void
+    {
+        self::init();
+
+        $start = microtime(true);
+
+        $action = (string)($_POST['action'] ?? '');
+        if ($action !== 'get_intersection_codes') {
+            self::log('INVALID_ACTION', ['action' => $action]);
+            self::json(['success' => false, 'error' => 'Invalid action']);
+        }
+
+        try {
+            $payload = self::readPayload();
+
+            //$payload['filterId'] = 'crm-type-item-list-161'; //test only
+
+            self::log('=== START ===', [
+                'userId'       => $payload['userId'],
+                'entityTypeId' => $payload['entityTypeId'],
+                'filterId'     => $payload['filterId'],
+                'page'         => $payload['page'],
+                'isLazy'       => $payload['isLazy'],
+                'popupCount'   => count($payload['popupFields']),
+            ]);
+
+            if (!self::isValidMinimalInput($payload)) {
+                self::log('INVALID_INPUT', $payload);
+                self::json([
+                    'success' => true,
+                    'codes'   => [],
+                    'debug'   => [
+                        'reason' => 'invalid_input',
+                        'popupCount' => count($payload['popupFields']),
+                        'configCount' => 0,
+                        'intersectionCount' => 0,
+                    ],
+                ]);
+            }
+
+            if (self::isAdmin($payload['userId'])) {
+                self::log('ADMIN_BYPASS', null);
+                self::json([
+                    'success'  => true,
+                    'elements' => ['*'],
+                    'codes'    => [],
+                    'debug'    => ['reason' => 'admin_bypass'],
+                ]);
+            }
+
+            // ---------------------------------------------------------
+            // Pass #1: run with given filterId
+            // ---------------------------------------------------------
+            $result = self::runOnce($payload);
+            $payload['filterId'] = 'crm-type-item-list-161';
+            // ---------------------------------------------------------
+            // Extra fallback:
+            // if filterId empty AND result is empty_config -> try to find any user grid in b_user_option and rerun once
+            // (max 1 retry!)
+            // ---------------------------------------------------------
+            $filterIdEmpty = (trim((string)$payload['filterId']) === '');
+            $shouldRetry = $filterIdEmpty && ($result['debug']['reason'] ?? '') === 'empty_config';
+
+            if ($shouldRetry) {
+                $alt = self::findAlternativeFilterIdFromUserOptions(
+                    (int)$payload['userId'],
+                    (int)$payload['entityTypeId'],
+                    (string)$payload['filterId']
+                );
+
+                if ($alt !== null && $alt !== '') {
+                    self::log('RETRY_ALT_FILTER_FOUND', $alt);
+
+                    $payloadRetry = $payload;
+                    $payloadRetry['filterId'] = $alt;
+
+                    $resultRetry = self::runOnce($payloadRetry);
+                    $resultRetry['debug']['retryUsed'] = true;
+                    $resultRetry['debug']['retryFilterId'] = $alt;
+
+                    $durationMs = (int)round((microtime(true) - $start) * 1000);
+                    self::log('DURATION_MS', $durationMs);
+                    self::log('=== END ===', null);
+
+                    self::json($resultRetry);
+                }
+
+                self::log('RETRY_ALT_FILTER_NOT_FOUND', null);
+            }
+
+            $durationMs = (int)round((microtime(true) - $start) * 1000);
+            self::log('DURATION_MS', $durationMs);
+            self::log('=== END ===', null);
+
+            self::json($result);
+
+        } catch (\Throwable $e) {
+            self::log('ERROR', $e->getMessage());
+            self::json(['success' => false, 'error' => $e->getMessage()]);
+        }
+    }
+
+    // =========================================================
+    // One pass
+    // =========================================================
+    private static function runOnce(array $payload): array
+    {
+        $resolved = self::resolveConfigIds((int)$payload['entityTypeId'], (string)$payload['filterId']);
+
+        self::log('BASENAME', $resolved['baseName']);
+        self::log('FILTER_ID', $payload['filterId']);
+        self::log('PIPELINE_ID', $resolved['pipelineId']);
+        self::log('RESOLVED_CONFIG_IDS', $resolved['candidateConfigIds']);
+        self::log('FALLBACK_DB_COMMON_NAMES', $resolved['fallbackCommonConfigNames']);
+        self::log('FALLBACK_DB_COMMON_LIKE', $resolved['fallbackCommonConfigNameLike']);
+
+        $configArray = self::loadEffectiveConfigArray(
+            (int)$payload['userId'],
+            (string)$resolved['categoryName'],
+            (array)$resolved['candidateConfigIds'],
+            (array)$resolved['fallbackCommonConfigNames'],
+            (string)$resolved['fallbackCommonConfigNameLike']
+        );
+
+        if (!is_array($configArray) || empty($configArray)) {
+            self::log('EMPTY_CONFIG', null);
+            self::logPopupSide($payload['popupFields']);
+
+            return [
+                'success' => true,
+                'codes'   => [],
+                'debug'   => [
+                    'reason' => 'empty_config',
+                    'popupCount' => count($payload['popupFields']),
+                    'configCount' => 0,
+                    'intersectionCount' => 0,
+                    'usedConfigIds' => $resolved['candidateConfigIds'],
+                    'filterId' => (string)$payload['filterId'],
+                ],
+            ];
+        }
+
+        // ---------------- Config codes
+        $configCodes = self::extractAllowedCodesFromConfig($configArray);
+        $configCodes = self::expandAliasGroups($configCodes);
+        $configCodes = self::uniqueCaseInsensitiveKeepOrder($configCodes);
+        self::log('CONFIG_CODES_DB', $configCodes);
+
+        // ---------------- Popup codes
+        $popupNormUnique = self::extractPopupNormalizedUnique($payload['popupFields'], (string)$payload['filterId']);
+        $popupNormUnique = self::expandAliasGroups($popupNormUnique);
+        $popupNormUnique = self::filterIgnoredPopupCodes($popupNormUnique);
+        $popupNormUnique = self::uniqueCaseInsensitiveKeepOrder($popupNormUnique);
+        self::log('POPUP_NORM_UNIQUE', $popupNormUnique);
+
+        // ---------------- Intersection
+        $allowed = self::buildIntersectionAllowed($popupNormUnique, $configCodes);
+
+        // ---------------- Logs (diffs)
+        self::logPopupSide($payload['popupFields']);
+        self::log('POPUP_ONLY', self::diffAminusB($popupNormUnique, $configCodes));
+        self::log('CONFIG_ONLY', self::diffAminusB($configCodes, $popupNormUnique));
+        self::log('INTERSECTION_ALLOWED', $allowed);
+
+        return [
+            'success' => true,
+            'codes'   => $allowed,
+            'debug'   => [
+                'reason' => 'ok',
+                'popupCount' => count($popupNormUnique),
+                'configCount' => count($configCodes),
+                'intersectionCount' => count($allowed),
+                'usedConfigIds' => $resolved['candidateConfigIds'],
+                'filterId' => (string)$payload['filterId'],
+            ],
+        ];
+    }
+
+    // =========================================================
+    // Init / payload / validation
+    // =========================================================
+    private static function init(): void
+    {
+        self::$logFile = $_SERVER['DOCUMENT_ROOT'] . '/local/logs/filter_debug.log';
+        self::ensureLogDir();
+    }
+
+    private static function readPayload(): array
+    {
+        $userId       = (int)($_POST['user_id'] ?? 0);
+        $entityTypeId = (int)($_POST['entityTypeId'] ?? 0);
+
+        // We use ONLY filterId now (no categoryId from JS)
+        $filterId = (string)($_POST['filterId'] ?? '');
+
+        $page   = (string)($_POST['page'] ?? '');
+        $isLazy = (string)($_POST['isLazy'] ?? '');
+
+        $popupFieldsRaw = (string)($_POST['popup_fields'] ?? '[]');
+        $popupFields = json_decode($popupFieldsRaw, true);
+        if (!is_array($popupFields)) {
+            $popupFields = [];
+        }
+
+        return [
+            'userId'       => $userId,
+            'entityTypeId' => $entityTypeId,
+            'filterId'     => $filterId,
+            'page'         => $page,
+            'isLazy'       => $isLazy,
+            'popupFields'  => $popupFields,
+        ];
+    }
+
+    private static function isValidMinimalInput(array $payload): bool
+    {
+        return ((int)$payload['userId'] > 0 && (int)$payload['entityTypeId'] > 0);
+    }
+
+    // =========================================================
+    // Admin
+    // =========================================================
+    private static function isAdmin(int $userId): bool
+    {
+        $groups  = \CUser::GetUserGroup($userId);
+        $isAdmin = in_array(1, $groups); // DO NOT change to strict
+
+        self::log('USER_GROUPS', $groups);
+        self::log('IS_ADMIN', $isAdmin);
+
+        return (bool)$isAdmin;
+    }
+
+    // =========================================================
+    // Resolve editor config ids from filterId
+    // =========================================================
+    private static function resolveConfigIds(int $entityTypeId, string $filterId): array
+    {
+        $categoryName = 'crm.entity.editor';
+        $baseName = self::getBaseName($entityTypeId);
+
+        $pipelineId = self::parsePipelineIdFromFilterId($filterId);
+
+        $candidateConfigIds = [];
+        $fallbackCommonConfigNames = [];
+        $fallbackCommonConfigNameLike = '';
+
+        $isDynamic = (stripos($baseName, 'DYNAMIC_') === 0);
+
+        // ----------------------------
+        // IMPORTANT: Dynamic uses only *_details_C{pipeline}
+        // No plain *_details in many portals.
+        // ----------------------------
+        if ($isDynamic) {
+            if ($pipelineId !== null) {
+                $candidateConfigIds[] = "{$baseName}_details_C{$pipelineId}";
+                $fallbackCommonConfigNames[] = "{$baseName}_details_C{$pipelineId}_common";
+            } else {
+                // If we have "ALL" view (no pipeline in filterId), there is no good exact id.
+                // We'll fallback to DB LIKE.
+                $fallbackCommonConfigNameLike = "{$baseName}_details_C%_common";
+            }
+
+            return [
+                'categoryName' => $categoryName,
+                'baseName' => $baseName,
+                'pipelineId' => $pipelineId,
+                'candidateConfigIds' => $candidateConfigIds,
+                'fallbackCommonConfigNames' => $fallbackCommonConfigNames,
+                'fallbackCommonConfigNameLike' => $fallbackCommonConfigNameLike,
+            ];
+        }
+
+        // ----------------------------
+        // Non-dynamic (deal/lead/company/contact/quote)
+        // ----------------------------
+        if ($pipelineId !== null) {
+            $candidateConfigIds[] = "{$baseName}_details_C{$pipelineId}";
+        }
+        $candidateConfigIds[] = "{$baseName}_details";
+
+        // DB fallback (USER=0)
+        if ($entityTypeId === 2) { // deal
+            if ($pipelineId !== null) {
+                $fallbackCommonConfigNames[] = "deal_details_c_{$pipelineId}_common";
+            }
+            $fallbackCommonConfigNames[] = "deal_details_common";
+        } else {
+            if ($pipelineId !== null) {
+                $fallbackCommonConfigNames[] = "{$baseName}_details_C{$pipelineId}_common";
+            }
+            $fallbackCommonConfigNames[] = "{$baseName}_details_common";
+        }
+
+        return [
+            'categoryName' => $categoryName,
+            'baseName' => $baseName,
+            'pipelineId' => $pipelineId,
+            'candidateConfigIds' => $candidateConfigIds,
+            'fallbackCommonConfigNames' => $fallbackCommonConfigNames,
+            'fallbackCommonConfigNameLike' => $fallbackCommonConfigNameLike,
+        ];
+    }
+
+    private static function parsePipelineIdFromFilterId(string $filterId): ?int
+    {
+        $filterId = trim((string)$filterId);
+        if ($filterId === '') {
+            return null;
+        }
+
+        // CRM_DEAL_LIST_V12_C_9
+        if (preg_match('/_C_(\d+)$/i', $filterId, $m)) {
+            $pid = (int)$m[1];
+            return ($pid > 0) ? $pid : null;
+        }
+
+        // crm-type-item-list-168-6
+        if (preg_match('/crm-type-item-list-\d+-(\d+)$/i', $filterId, $m)) {
+            $pid = (int)$m[1];
+            return ($pid > 0) ? $pid : null;
+        }
+
+        return null;
+    }
+
+    // =========================================================
+    // NEW: find alternative filterId (grid id) from b_user_option if filterId is empty
+    // =========================================================
+    private static function findAlternativeFilterIdFromUserOptions(int $userId, int $entityTypeId, string $currentFilterId): ?string
+    {
+        $currentFilterId = trim((string)$currentFilterId);
+
+        $patterns = self::buildGridNamePatternsForEntity($entityTypeId);
+        if (empty($patterns)) {
+            return null;
+        }
+
+        $categories = [
+            'main.ui.filter',
+            'main.ui.grid',
+        ];
+
+        $conn = Application::getConnection();
+        $h = $conn->getSqlHelper();
+
+        $whereCats = [];
+        foreach ($categories as $cat) {
+            $whereCats[] = "'" . $h->forSql($cat) . "'";
+        }
+        $whereCatsSql = implode(',', $whereCats);
+
+        $whereNames = [];
+        foreach ($patterns as $p) {
+            $whereNames[] = "NAME LIKE '" . $h->forSql($p) . "'";
+        }
+        $whereNamesSql = implode(' OR ', $whereNames);
+
+        $sql = "
+            SELECT NAME, CATEGORY
+            FROM b_user_option
+            WHERE USER_ID = " . (int)$userId . "
+              AND CATEGORY IN ($whereCatsSql)
+              AND ($whereNamesSql)
+            LIMIT 200
+        ";
+
+        $rows = [];
+        $res = $conn->query($sql);
+        while ($r = $res->fetch()) {
+            $name = trim((string)($r['NAME'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            if ($currentFilterId !== '' && strcasecmp($name, $currentFilterId) === 0) {
+                continue;
+            }
+            $rows[] = $name;
+        }
+
+        $rows = self::uniqueCaseInsensitiveKeepOrder($rows);
+        self::log('ALT_FILTER_CANDIDATES', $rows);
+
+        if (empty($rows)) {
+            return null;
+        }
+
+        return self::pickBestGridNameCandidate($rows, $entityTypeId) ?: null;
+    }
+
+    private static function buildGridNamePatternsForEntity(int $entityTypeId): array
+    {
+        switch ($entityTypeId) {
+            case 1:  return ['CRM_LEAD_LIST_%'];
+            case 2:  return ['CRM_DEAL_LIST_%'];
+            case 3:  return ['CRM_CONTACT_LIST_%'];
+            case 4:  return ['CRM_COMPANY_LIST_%'];
+            case 7:  return ['CRM_QUOTE_LIST_%', 'CRM_QUOTE_%'];
+            default:
+                // dynamic: crm-type-item-list-<typeId> and crm-type-item-list-<typeId>-<pipeline>
+                return [
+                    'crm-type-item-list-' . (int)$entityTypeId . '%',
+                    'CRM-TYPE-ITEM-LIST-' . (int)$entityTypeId . '%',
+                ];
+        }
+    }
+
+    private static function pickBestGridNameCandidate(array $candidates, int $entityTypeId): ?string
+    {
+        $bestWithPipeline = null;
+        $bestAny = null;
+
+        foreach ($candidates as $name) {
+            $bestAny ??= $name;
+
+            if ($entityTypeId === 2) {
+                if (preg_match('/_C_(\d+)$/i', $name, $m) && (int)$m[1] > 0) {
+                    $bestWithPipeline = $name;
+                    break;
+                }
+                continue;
+            }
+
+            if ($entityTypeId !== 1 && $entityTypeId !== 3 && $entityTypeId !== 4 && $entityTypeId !== 7) {
+                if (preg_match('/crm-type-item-list-\d+-(\d+)$/i', $name, $m) && (int)$m[1] > 0) {
+                    $bestWithPipeline = $name;
+                    break;
+                }
+            }
+        }
+
+        return $bestWithPipeline ?: $bestAny;
+    }
+
+    // =========================================================
+    // Config loading (user scopes + DB common fallback)
+    // =========================================================
+    private static function loadEffectiveConfigArray(
+        int $userId,
+        string $categoryName,
+        array $candidateConfigIds,
+        array $fallbackCommonConfigNames,
+        string $fallbackCommonConfigNameLike
+    ): array {
+        $configuration = new EntityEditorConfiguration($categoryName, $userId);
+
+        // 1) try user configs (scopes)
+        foreach ($candidateConfigIds as $configId) {
+            $cfg = self::loadConfigWithScopeResolution($configuration, $userId, (string)$configId);
+            $cfgArray = self::unwrapConfigToArray($cfg);
+            if (is_array($cfgArray) && !empty($cfgArray)) {
+                self::log('USED_CONFIG_ID', $configId);
+                return $cfgArray;
+            }
+        }
+
+        // 2) try USER=0 exact names
+        foreach ($fallbackCommonConfigNames as $name) {
+            $cfgArray = self::loadCommonConfigFromDbExact($categoryName, (string)$name);
+            if (is_array($cfgArray) && !empty($cfgArray)) {
+                self::log('USED_DB_COMMON_NAME', $name);
+                return $cfgArray;
+            }
+        }
+
+        //3) try USER=0 LIKE names (dynamic ALL view etc.)
+        $fallbackCommonConfigNameLike = trim((string)$fallbackCommonConfigNameLike);
+        if ($fallbackCommonConfigNameLike !== '') {
+            $cfgArray = self::loadCommonConfigFromDbLikeBest($categoryName, $fallbackCommonConfigNameLike);
+            if (is_array($cfgArray) && !empty($cfgArray)) {
+                self::log('USED_DB_COMMON_LIKE', $fallbackCommonConfigNameLike);
+                return $cfgArray;
+            }
+        }
+
+        return [];
+    }
+
+    private static function loadConfigWithScopeResolution(
+        EntityEditorConfiguration $configuration,
+        int $userId,
+        string $configId
+    ) {
+        $storedScope = $configuration->getScope($configId);
+
+        $configScope = EntityEditorConfigScope::UNDEFINED;
+        $userScopeId = 0;
+
+        if (is_array($storedScope)) {
+            $configScope = (string)($storedScope['scope'] ?? EntityEditorConfigScope::UNDEFINED);
+            $userScopeId = (int)($storedScope['userScopeId'] ?? 0);
+        } else {
+            $configScope = (string)$storedScope;
+        }
+
+        self::log('STORED_SCOPE', $storedScope);
+        self::log('RESOLVED_SCOPE', $configScope);
+        self::log('USER_SCOPE_ID', $userScopeId);
+
+        $config = null;
+
+        // CUSTOM scope resolve
+        if ($configScope === EntityEditorConfigScope::CUSTOM && class_exists('\Bitrix\Ui\EntityForm\Scope')) {
+            if ($userScopeId > 0) {
+                $config = \Bitrix\Ui\EntityForm\Scope::getInstance($userId)->getScopeById($userScopeId);
+            }
+            if (!$config) {
+                $configScope = EntityEditorConfigScope::UNDEFINED;
+            }
+        }
+
+        // load defined scope
+        if (!$config && EntityEditorConfigScope::isDefined($configScope)) {
+            $config = $configuration->get($configId, $configScope);
+        }
+
+        // fallback: PERSONAL -> COMMON
+        if (!$config) {
+            $config = $configuration->get($configId, EntityEditorConfigScope::PERSONAL);
+            if (!is_array($config) || empty($config)) {
+                $config = $configuration->get($configId, EntityEditorConfigScope::COMMON);
+            }
+        }
+
+        return $config;
+    }
+
+    private static function unwrapConfigToArray($config): array
+    {
+        if (is_array($config)) {
+            $cfgArray = $config['CONFIG'] ?? $config;
+            return (is_array($cfgArray) ? $cfgArray : []);
+        }
+        return [];
+    }
+
+    private static function loadCommonConfigFromDbExact(string $category, string $name): array
+    {
+        $conn = Application::getConnection();
+        $h = $conn->getSqlHelper();
+
+        $sql = "
+            SELECT VALUE
+            FROM b_user_option
+            WHERE CATEGORY = '".$h->forSql($category)."'
+              AND NAME = '".$h->forSql($name)."'
+              AND USER_ID = 0
+            LIMIT 1
+        ";
+
+        $row = $conn->query($sql)->fetch();
+        if (!$row || empty($row['VALUE'])) {
+            return [];
+        }
+
+        return self::decodeUserOptionValueToConfigArray((string)$row['VALUE']);
+    }
+
+    private static function loadCommonConfigFromDbLikeBest(string $category, string $nameLike): array
+    {
+        $conn = Application::getConnection();
+        $h = $conn->getSqlHelper();
+
+        // Heuristic: prefer "highest" NAME (often C12 > C9); stable and cheap.
+        $sql = "
+            SELECT NAME, VALUE
+            FROM b_user_option
+            WHERE CATEGORY = '".$h->forSql($category)."'
+              AND USER_ID = 0
+              AND NAME LIKE '".$h->forSql($nameLike)."'
+            ORDER BY NAME DESC
+            LIMIT 50
+        ";
+
+        $res = $conn->query($sql);
+
+        while ($row = $res->fetch()) {
+            if (empty($row['VALUE'])) {
+                continue;
+            }
+            $cfg = self::decodeUserOptionValueToConfigArray((string)$row['VALUE']);
+            if (is_array($cfg) && !empty($cfg)) {
+                self::log('DB_LIKE_PICKED_NAME', (string)$row['NAME']);
+                return $cfg;
+            }
+        }
+
+        return [];
+    }
+
+    private static function decodeUserOptionValueToConfigArray(string $value): array
+    {
+        $arr = @unserialize($value, ['allowed_classes' => false]);
+        if (is_array($arr)) {
+            return $arr;
+        }
+
+        $json = json_decode((string)$value, true);
+        return is_array($json) ? $json : [];
+    }
+
+    // =========================================================
+    // Allowed codes extraction from config
+    // =========================================================
+    private static function extractAllowedCodesFromConfig(array $configArray): array
+    {
+        $allowedCodes = [];
+
+        $stack = [$configArray];
+        while (!empty($stack)) {
+            $arr = array_pop($stack);
+            if (!is_array($arr)) {
+                continue;
+            }
+
+            foreach ($arr as $item) {
+                if (!is_array($item)) {
+                    continue;
+                }
+
+                if (!empty($item['elements']) && is_array($item['elements'])) {
+                    $stack[] = $item['elements'];
+                }
+
+                $name = trim((string)($item['name'] ?? ''));
+                if ($name === '') {
+                    continue;
+                }
+
+                $type = (string)($item['type'] ?? '');
+                if (in_array($type, ['column', 'section'], true)) {
+                    continue;
+                }
+
+                $allowedCodes[] = self::normalizeFieldCode($name);
+            }
+        }
+
+        foreach (self::getAlwaysAllowedBaseCodes() as $c) {
+            $allowedCodes[] = $c;
+        }
+
+        return self::uniqueCaseInsensitiveKeepOrder($allowedCodes);
+    }
+
+    private static function getAlwaysAllowedBaseCodes(): array
+    {
+        return [
+            'ID',
+            'TITLE',
+            'DATE_CREATE',
+            'DATE_MODIFY',
+            'ASSIGNED_BY_ID',
+        ];
+    }
+
+    // =========================================================
+    // Popup processing
+    // =========================================================
+    private static function extractPopupNormalizedUnique(array $popupFields, string $filterId): array
+    {
+        $list = [];
+
+        foreach ($popupFields as $pf) {
+            if (!is_array($pf)) {
+                continue;
+            }
+
+            $raw  = (string)($pf['rawId'] ?? '');
+            $norm = (string)($pf['normalized'] ?? '');
+            if ($norm === '') {
+                $norm = $raw;
+            }
+
+            $norm = self::normalizePopupFieldCode($norm, $filterId);
+            if ($norm !== '') {
+                $list[] = $norm;
+            }
+        }
+
+        return self::uniqueCaseInsensitiveKeepOrder($list);
+    }
+
+    private static function normalizePopupFieldCode(string $code, string $filterId): string
+    {
+        $code = self::normalizeFieldCode($code);
+        if ($code === '') {
+            return '';
+        }
+
+        // Remove suffix "_<filterId>" if present
+        if ($filterId !== '') {
+            $suffix = '_' . $filterId;
+            if (mb_substr($code, -mb_strlen($suffix)) === $suffix) {
+                $code = mb_substr($code, 0, mb_strlen($code) - mb_strlen($suffix));
+                $code = trim((string)$code);
+            }
+        }
+
+        // Generic cleanup: *_crm-type-item-list-142-12
+        if (preg_match('/^(.*)_crm-type-item-list-\d+(?:-\d+)?$/i', $code, $m)) {
+            $code = trim((string)$m[1]);
+        }
+
+        return $code;
+    }
+
+    private static function filterIgnoredPopupCodes(array $codes): array
+    {
+        $out = [];
+
+        foreach ($codes as $c) {
+            $c = trim((string)$c);
+            if ($c === '') {
+                continue;
+            }
+
+            $uc = mb_strtoupper($c);
+
+            // Ignore ACTIVITY_FASTSEARCH_*
+            if (stripos($uc, 'ACTIVITY_FASTSEARCH_') === 0) {
+                continue;
+            }
+
+            // Ignore CONTACT_* except CONTACT_ID / CONTACT_IDS
+            if (stripos($uc, 'CONTACT_') === 0) {
+                if ($uc === 'CONTACT_ID' || $uc === 'CONTACT_IDS') {
+                    $out[] = $c;
+                }
+                continue;
+            }
+
+            // Ignore COMPANY_* except COMPANY_ID / COMPANY_IDS
+            if (stripos($uc, 'COMPANY_') === 0) {
+                if ($uc === 'COMPANY_ID' || $uc === 'COMPANY_IDS') {
+                    $out[] = $c;
+                }
+                continue;
+            }
+
+            $out[] = $c;
+        }
+
+        return $out;
+    }
+
+    // =========================================================
+    // Intersection rules
+    // =========================================================
+    private static function buildIntersectionAllowed(array $popupCodes, array $configCodes): array
+    {
+        $configSet = [];
+        foreach ($configCodes as $c) {
+            $k = mb_strtolower(trim((string)$c));
+            if ($k !== '') {
+                $configSet[$k] = true;
+            }
+        }
+
+        $configHasAddress = self::configHasCode($configCodes, 'ADDRESS');
+
+        $rqAddressFields = [
+            'RQ_ADDR|46|0|ADDRESS_1',
+            'RQ_ADDR|46|0|CITY',
+            'RQ_ADDR|46|0|POSTAL_CODE',
+            'RQ_ADDR|46|0|REGION',
+            'RQ_ADDR|46|0|PROVINCE',
+            'RQ_ADDR|46|0|COUNTRY',
+        ];
+
+        $allowed = [];
+        $seen = [];
+        $forced = [];
+
+        foreach ($popupCodes as $c) {
+            $c = trim((string)$c);
+            if ($c === '') {
+                continue;
+            }
+
+            $k = mb_strtolower($c);
+
+            // Always allow base
+            if (self::isAlwaysAllowedCode($c)) {
+                if (!isset($seen[$k])) {
+                    $seen[$k] = true;
+                    $allowed[] = $c;
+                }
+                continue;
+            }
+
+            // RQ_ rule:
+            // allow all RQ_* but address block only if config has ADDRESS
+            if (preg_match('/^RQ_/i', $c)) {
+                if (in_array($c, $rqAddressFields, true) && !$configHasAddress) {
+                    continue;
+                }
+                if (!isset($seen[$k])) {
+                    $seen[$k] = true;
+                    $allowed[] = $c;
+                    $forced[] = $c;
+                }
+                continue;
+            }
+
+            if (isset($configSet[$k]) && !isset($seen[$k])) {
+                $seen[$k] = true;
+                $allowed[] = $c;
+            }
+        }
+
+        self::log('FORCED_ALLOWED_RQ', $forced);
+
+        return $allowed;
+    }
+
+    private static function isAlwaysAllowedCode(string $code): bool
+    {
+        $code = mb_strtoupper(trim((string)$code));
+        if ($code === '') {
+            return false;
+        }
+        foreach (self::getAlwaysAllowedBaseCodes() as $a) {
+            if ($code === mb_strtoupper($a)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static function configHasCode(array $configCodes, string $needle): bool
+    {
+        $needle = mb_strtolower(trim((string)$needle));
+        foreach ($configCodes as $c) {
+            if (mb_strtolower(trim((string)$c)) === $needle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // =========================================================
+    // Alias groups (single place)
+    // =========================================================
+    private static function expandAliasGroups(array $codes): array
+    {
+        $out  = [];
+        $seen = [];
+
+        foreach ($codes as $c) {
+            $c = trim((string)$c);
+            if ($c === '') {
+                continue;
+            }
+
+            $k = mb_strtolower($c);
+            if (!isset($seen[$k])) {
+                $seen[$k] = true;
+                $out[] = $c;
+            }
+
+            $uc = mb_strtoupper($c);
+
+            // OPPORTUNITY -> OPPORTUNITY_WITH_CURRENCY
+            if ($uc === 'OPPORTUNITY') {
+                $alias = 'OPPORTUNITY_WITH_CURRENCY';
+                $ak = mb_strtolower($alias);
+                if (!isset($seen[$ak])) {
+                    $seen[$ak] = true;
+                    $out[] = $alias;
+                }
+            }
+
+            // OBSERVER/OBSERVERS <-> OBSERVER_IDS
+            if ($uc === 'OBSERVER') {
+                foreach (['OBSERVERS', 'OBSERVER_IDS'] as $alias) {
+                    $ak = mb_strtolower($alias);
+                    if (!isset($seen[$ak])) {
+                        $seen[$ak] = true;
+                        $out[] = $alias;
+                    }
+                }
+            } elseif ($uc === 'OBSERVERS') {
+                foreach (['OBSERVER', 'OBSERVER_IDS'] as $alias) {
+                    $ak = mb_strtolower($alias);
+                    if (!isset($seen[$ak])) {
+                        $seen[$ak] = true;
+                        $out[] = $alias;
+                    }
+                }
+            } elseif ($uc === 'OBSERVER_IDS') {
+                foreach (['OBSERVER', 'OBSERVERS'] as $alias) {
+                    $ak = mb_strtolower($alias);
+                    if (!isset($seen[$ak])) {
+                        $seen[$ak] = true;
+                        $out[] = $alias;
+                    }
+                }
+            }
+
+            // REVENUE_WITH_CURRENCY -> REVENUE (+CURRENCY_ID)
+            if ($uc === 'REVENUE_WITH_CURRENCY') {
+                foreach (['REVENUE', 'CURRENCY_ID'] as $alias) {
+                    $ak = mb_strtolower($alias);
+                    if (!isset($seen[$ak])) {
+                        $seen[$ak] = true;
+                        $out[] = $alias;
+                    }
+                }
+            }
+
+            // ASSIGNED_BY <-> ASSIGNED_BY_ID
+            if ($uc === 'ASSIGNED_BY') {
+                $alias = 'ASSIGNED_BY_ID';
+                $ak = mb_strtolower($alias);
+                if (!isset($seen[$ak])) {
+                    $seen[$ak] = true;
+                    $out[] = $alias;
+                }
+            } elseif ($uc === 'ASSIGNED_BY_ID') {
+                $alias = 'ASSIGNED_BY';
+                $ak = mb_strtolower($alias);
+                if (!isset($seen[$ak])) {
+                    $seen[$ak] = true;
+                    $out[] = $alias;
+                }
+            }
+
+            // Generic alias: *_ID -> * (non-UF only)
+            if (stripos($c, 'UF_') !== 0 && preg_match('/_ID$/i', $c)) {
+                $alias = preg_replace('/_ID$/i', '', $c);
+                $alias = trim((string)$alias);
+                if ($alias !== '') {
+                    $ak = mb_strtolower($alias);
+                    if (!isset($seen[$ak])) {
+                        $seen[$ak] = true;
+                        $out[] = $alias;
+                    }
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    // =========================================================
+    // Utilities
+    // =========================================================
+    private static function diffAminusB(array $a, array $b): array
+    {
+        $bSet = [];
+        foreach ($b as $x) {
+            $bSet[mb_strtolower(trim((string)$x))] = true;
+        }
+
+        $out = [];
+        foreach ($a as $x) {
+            $k = mb_strtolower(trim((string)$x));
+            if ($k !== '' && !isset($bSet[$k])) {
+                $out[] = $x;
+            }
+        }
+        return $out;
+    }
+
+    private static function uniqueCaseInsensitiveKeepOrder(array $list): array
+    {
+        $out = [];
+        $seen = [];
+
+        foreach ($list as $c) {
+            $c = trim((string)$c);
+            if ($c === '') {
+                continue;
+            }
+            $k = mb_strtolower($c);
+            if (!isset($seen[$k])) {
+                $seen[$k] = true;
+                $out[] = $c;
+            }
+        }
+
+        return $out;
+    }
+
+    private static function getBaseName(int $entityTypeId): string
+    {
+        switch ($entityTypeId) {
+            case 1: return 'lead';
+            case 2: return 'deal';
+            case 3: return 'contact';
+            case 4: return 'company';
+            case 7: return 'QUOTE';
+            default:
+                return 'DYNAMIC_' . $entityTypeId;
+        }
+    }
+
+    private static function normalizeFieldCode(string $id): string
+    {
+        $id = trim((string)$id);
+        if ($id === '') {
+            return '';
+        }
+
+        $id = preg_replace('/^field_/i', '', $id);
+        $id = preg_replace('/^FIELD_/i', '', $id);
+        $id = preg_replace('/^field:/i', '', $id);
+
+        return trim((string)$id);
+    }
+
+    // =========================================================
+    // Logging / json
+    // =========================================================
+    private static function ensureLogDir(): void
+    {
+        $dir = dirname(self::$logFile);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+    }
+
+    private static function log(string $label, $data = null): void
+    {
+        $line = date('c') . ' | ' . $label;
+        if ($data !== null) {
+            $line .= ' | ' . (is_string($data) ? $data : print_r($data, true));
+        }
+        file_put_contents(self::$logFile, $line . PHP_EOL, FILE_APPEND | LOCK_EX);
+    }
+
+    private static function logPopupSide(array $popupFields): void
+    {
+        self::log('POPUP_FIELDS_RAW_JSON', json_encode($popupFields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    }
+
+    private static function json(array $data): void
+    {
+        header('Content-Type: application/json; charset=utf-8');
+        echo Json::encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        die();
+    }
+}
+
+LinxysFilterFieldsAjax::run();
