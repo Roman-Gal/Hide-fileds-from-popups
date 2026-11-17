@@ -1,3 +1,8 @@
+/**
+ * Object method fragment for the Bitrix popup component.
+ * The host supplies getParam, popup rendering helpers, and the BX runtime.
+ * Both lazy and preloaded field lists pass through the same allowed-code filter.
+ */
 		// task#49999
 		getFieldsListPopupContentLinxys: function getFieldsListPopupContentLinxys() {
 
