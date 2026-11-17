@@ -593,6 +593,8 @@ if (empty($allowedCodes)) {
 // -----------------------------------------------------
 // Build allowed set (UPPERCASE) for fast checks
 // -----------------------------------------------------
+// Both grouped and flat column lists use this normalized lookup.
+// Only field-code comparisons are uppercased; column descriptors retain their original values.
 $allowedSet = [];
 foreach ($allowedCodes as $c) {
     $c = strtoupper(trim((string)$c));
