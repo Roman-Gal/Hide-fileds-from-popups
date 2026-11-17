@@ -16,6 +16,11 @@ Loader::includeModule('ui');
 Loader::includeModule('crm');
 Loader::includeModule('intranet');
 
+/**
+ * Handles the popup field-code request after the Bitrix prolog initializes the runtime.
+ * Regular responses expose allowed codes through the codes array.
+ * Administrator responses use elements ["*"], which the popup treats as a wildcard.
+ */
 final class LinxysFilterFieldsAjax
 {
     private static string $logFile;
