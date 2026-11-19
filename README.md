@@ -1,28 +1,58 @@
-# Module-Test-Agent
+# Bitrix24 CRM Field Visibility
 
-This repository contains Bitrix CRM snippets that filter the fields offered in popup settings and grid column settings using the user's entity editor configuration.
+PHP and JavaScript customizations that align CRM field-selection popups and grid column settings with the current user's entity editor configuration.
+
+## Features
+
+- Filters field-selection popups and available grid columns.
+- Supports classic CRM entities and Smart Process lists.
+- Resolves personal and common entity editor configurations.
+- Normalizes field codes and aliases before matching them.
+- Handles both preloaded and lazy-loaded popup fields.
+- Preserves the administrator bypass for the popup endpoint.
+- Sorts visible field titles for easier navigation.
+
+## How it works
+
+1. The popup method collects field descriptors and the CRM entity context.
+2. An authenticated AJAX request sends them to `ajax.php`.
+3. The PHP endpoint loads the current user's editor configuration and computes allowed codes.
+4. The frontend filters the popup list. `result_modifier.php` separately filters the grid column settings.
+
+The frontend requests `/local/js/linxys.hidefieldsinsettings/ajax.php`. Keep that deployment path or update it in the snippet.
 
 ## Files
 
-- `script.js` contains the `getFieldsListPopupContentLinxys` object method. It loads popup fields, requests the allowed codes from the PHP endpoint, filters the list, and sorts the visible titles.
-- `ajax,php` contains the `LinxysFilterFieldsAjax` endpoint. The JavaScript calls it at `/local/js/linxys.hidefieldsinsettings/ajax.php`, so deploy this file with the `.php` extension at that location.
-- `result_modifier.php` filters the grouped and flat grid column lists in a Bitrix component result.
+| File | Integration point |
+| --- | --- |
+| `script.js` | The `getFieldsListPopupContentLinxys` method inside the existing Bitrix popup component |
+| `ajax.php` | PHP endpoint with the Bitrix prolog and CRM configuration lookup |
+| `result_modifier.php` | Result modifier in a customized Bitrix component template |
 
-## Request flow
+`script.js` is an object-method fragment that uses the host component's methods and the `BX` runtime. Insert it into the relevant component object.
 
-1. The popup method reads the CRM entity from the page URL and sends the available fields and filter identifier to the endpoint.
-2. The endpoint resolves the entity editor configuration, normalizes field codes and aliases, and returns the allowed codes. Administrators receive the wildcard response handled by the popup method.
-3. The popup displays the permitted fields in title order. The result modifier separately applies the editor configuration to the available grid columns.
+The endpoint previously used the repository filename `ajax,php`; it now uses the matching `.php` extension.
 
-## Local checks
+## Installation
 
-Run these syntax checks from the repository directory with PHP available in the terminal.
+1. Use a test Bitrix24 installation with the main, UI, CRM and intranet modules available.
+2. Deploy `ajax.php` at the path above.
+3. Integrate the JavaScript method into the popup component and connect the result modifier to the grid component template.
+4. Configure representative personal and common entity editor layouts.
+5. Check an ordinary user's popup and grid settings, then repeat as an administrator.
+6. Exercise both lazy loading and the already-loaded field list.
+
+AJAX requests include the Bitrix session token. The endpoint obtains the user identity from the active Bitrix session. Diagnostic file logging is disabled by default; enable it explicitly when debugging an integration.
+
+## Checks
 
 ```sh
-php -l "ajax,php"
+php -l ajax.php
 php -l result_modifier.php
 ```
 
-The JavaScript file is an object method fragment. Check it inside an object wrapper when using a standalone JavaScript parser.
+Check the JavaScript fragment inside an object wrapper when using a standalone parser. A complete integration check also needs the Bitrix runtime and its database.
 
-Integration testing uses a Bitrix installation with the CRM, UI, and intranet modules and representative entity editor configurations. Compare an administrator with an ordinary user and exercise both lazy-loaded and already-loaded popup fields.
+## Scope
+
+This customization controls which fields appear in configuration interfaces. Configure CRM access rights separately in Bitrix24. Exact entity, category and grid identifiers depend on the portal.

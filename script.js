@@ -3,245 +3,226 @@
  * The host supplies getParam, popup rendering helpers, and the BX runtime.
  * Both lazy and preloaded field lists pass through the same allowed-code filter.
  */
-		// task#49999
-		getFieldsListPopupContentLinxys: function getFieldsListPopupContentLinxys() {
+getFieldsListPopupContentLinxys: function getFieldsListPopupContentLinxys() {
+    var p = new BX.Promise();
+    var fields = this.getParam('FIELDS');
 
-			var p = new BX.Promise();
-			var fields = this.getParam('FIELDS');
-			console.log('this', this); //test
-			// ---------- helpers ----------
-			var getEntityInfoFromUrl = function () {
-				var path = (location.pathname || '').toLowerCase();
+    // Context and field normalization helpers.
+    var getEntityInfoFromUrl = function () {
+        var path = (location.pathname || '').toLowerCase();
 
-				// SPA
-				var entityTypeId = parseInt((path.match(/\/type\/(\d+)/) || [])[1] || 0, 10);
-				var categoryId   = parseInt((path.match(/\/category\/(\d+)/) || [])[1] || 0, 10);
+        // SPA
+        var entityTypeId = parseInt((path.match(/\/type\/(\d+)/) || [])[1] || 0, 10);
+        var categoryId = parseInt((path.match(/\/category\/(\d+)/) || [])[1] || 0, 10);
 
-				if (entityTypeId > 0) {
-					return { entityTypeId: entityTypeId, categoryId: categoryId };
-				}
+        if (entityTypeId > 0) {
+            return { entityTypeId: entityTypeId, categoryId: categoryId };
+        }
 
-				var p = new BX.Promise();
-				var fields = this.getParam('FIELDS');
+        // Classic CRM
+        if (path.includes('/lead/')) entityTypeId = 1;
+        else if (path.includes('/deal/')) entityTypeId = 2;
+        else if (path.includes('/contact/')) entityTypeId = 3;
+        else if (path.includes('/company/')) entityTypeId = 4;
+        else if (path.includes('/quote/')) entityTypeId = 7;
 
-				// ---------- helpers ----------
-				var getEntityInfoFromUrl = function () {
-					var path = (location.pathname || '').toLowerCase();
+        return { entityTypeId: entityTypeId, categoryId: (categoryId || 0) };
+    };
 
-					// SPA
-					var entityTypeId = parseInt((path.match(/\/type\/(\d+)/) || [])[1] || 0, 10);
-					var categoryId = parseInt((path.match(/\/category\/(\d+)/) || [])[1] || 0, 10);
+    var getFieldId = function (field) {
+        if (!field || typeof field !== 'object') return '';
+        return field.ID || field.Id || field.id || '';
+    };
 
-					if (entityTypeId > 0) {
-						return { entityTypeId: entityTypeId, categoryId: categoryId };
-					}
+    var normalizeFieldCode = function (id) {
+        id = String(id || '').trim();
 
-					// Classic CRM
-					if (path.includes('/lead/')) entityTypeId = 1;
-					else if (path.includes('/deal/')) entityTypeId = 2;
-					else if (path.includes('/contact/')) entityTypeId = 3;
-					else if (path.includes('/company/')) entityTypeId = 4;
-					else if (path.includes('/quote/')) entityTypeId = 7;
+        id = id.replace(/^field_/i, '');
+        id = id.replace(/^field:/i, '');
 
-					return { entityTypeId: entityTypeId, categoryId: (categoryId || 0) };
-				};
+        return id.trim();
+    };
 
-				var getFieldId = function (field) {
-					if (!field || typeof field !== 'object') return '';
-					return field.ID || field.Id || field.id || '';
-				};
+    var buildPopupPayload = function (fieldsList) {
+        if (!Array.isArray(fieldsList)) return [];
 
-				var normalizeFieldCode = function (id) {
-					id = String(id || '').trim();
+        return fieldsList.map(function (f) {
+            var rawId = getFieldId(f);
+            return {
+                rawId: rawId,
+                normalized: normalizeFieldCode(rawId),
+                label: String(
+                    (f && (f.LABEL || f.NAME || f.TITLE || f.CAPTION)) || ''
+                ).trim()
+            };
+        });
+    };
 
-					id = id.replace(/^field_/i, '');
-					id = id.replace(/^FIELD_/i, '');
-					id = id.replace(/^field:/i, '');
+    /**
+     * One request:
+     * - send popup fields (rawId + normalized + label)
+     * - backend loads entity editor config codes
+     * - backend compares the configuration and available popup fields
+     * - backend returns ONLY intersection codes
+     */
+    var loadIntersectionCodesFromServer = function (popupFieldsList) {
+        var q = new BX.Promise();
 
-					return id.trim();
-				};
+        var info = getEntityInfoFromUrl();
+        var popupPayload = buildPopupPayload(popupFieldsList);
+        BX.ajax({
+            url: '/local/js/linxys.hidefieldsinsettings/ajax.php',
+            method: 'POST',
+            dataType: 'json',
+            data: {
+                action: 'get_intersection_codes',
+                sessid: BX.bitrix_sessid(),
+                entityTypeId: info.entityTypeId,
+                categoryId: info.categoryId,
 
-				var buildPopupPayload = function (fieldsList) {
-					if (!Array.isArray(fieldsList)) return [];
+                filterId: this.getParam('FILTER_ID') || '',
+                page: (location.pathname || ''),
+                isLazy: this.getParam('LAZY_LOAD') ? 'Y' : 'N',
+                popup_fields: JSON.stringify(popupPayload)
+            },
+            onsuccess: function (res) {
 
-					return fieldsList.map(function (f) {
-						var rawId = getFieldId(f);
-						return {
-							rawId: rawId,
-							normalized: normalizeFieldCode(rawId),
-							label: String(
-								(f && (f.LABEL || f.NAME || f.TITLE || f.CAPTION)) || ''
-							).trim()
-						};
-					});
-				};
+                // Admin bypass: elements=["*"]
+                if (res && Array.isArray(res.elements) && res.elements.length === 1 && res.elements[0] === '*') {
+                    q.fulfill('*');
+                    return;
+                }
 
-				/**
-				 * One request:
-				 * - send popup fields (rawId + normalized + label)
-				 * - backend loads entity editor config codes
-				 * - backend compares & logs everything
-				 * - backend returns ONLY intersection codes
-				 */
-				var loadIntersectionCodesFromServer = function (popupFieldsList) {
-					var q = new BX.Promise();
+                // Normal: intersection codes
+                if (res && Array.isArray(res.codes)) {
+                    q.fulfill(res.codes);
+                    return;
+                }
 
-					var userId = BX.message('USER_ID');
-					var info = getEntityInfoFromUrl();
-					var popupPayload = buildPopupPayload(popupFieldsList);
-					BX.ajax({
-						url: '/local/js/linxys.hidefieldsinsettings/ajax.php',
-						method: 'POST',
-						dataType: 'json',
-						data: {
-							action: 'get_intersection_codes',
-							user_id: userId,
-							entityTypeId: info.entityTypeId,
-							categoryId: info.categoryId,
+                // Fallback: strict hide-all
+                q.fulfill([]);
+            },
+            onfailure: function () {
+                // strict hide-all on failure (so we don't expose hidden fields)
+                q.fulfill([]);
+            }
+        });
 
-							filterId: this.getParam('FILTER_ID') || '',
-							page: (location.pathname || ''),
-							isLazy: this.getParam('LAZY_LOAD') ? 'Y' : 'N',
-							popup_fields: JSON.stringify(popupPayload)
-						},
-						onsuccess: function (res) {
+        return q;
+    }.bind(this);
 
-							// Admin bypass: elements=["*"]
-							if (res && Array.isArray(res.elements) && res.elements.length === 1 && res.elements[0] === '*') {
-								q.fulfill('*');
-								return;
-							}
+    var normalizeAllowedSet = function (allowedCodes) {
+        var set = {};
+        (allowedCodes || []).forEach(function (c) {
+            var code = normalizeFieldCode(c);
+            if (code) set[code] = true;
+        });
+        return set;
+    };
 
-							// Normal: intersection codes
-							if (res && Array.isArray(res.codes)) {
-								q.fulfill(res.codes);
-								return;
-							}
+    var filterFieldsByCodes = function (fieldsList, allowedCodes) {
 
-							// Fallback: strict hide-all
-							q.fulfill([]);
-						},
-						onfailure: function () {
-							// strict hide-all on failure (so we don't expose hidden fields)
-							q.fulfill([]);
-						}
-					});
+        // Admin -> keep all
+        if (allowedCodes === '*') return fieldsList;
 
-					return q;
-				}.bind(this);
+        if (!Array.isArray(fieldsList)) return [];
 
-				var normalizeAllowedSet = function (allowedCodes) {
-					var set = {};
-					(allowedCodes || []).forEach(function (c) {
-						var code = normalizeFieldCode(c);
-						if (code) set[code] = true;
-					});
-					return set;
-				};
+        // STRICT: empty intersection => show nothing
+        if (!Array.isArray(allowedCodes) || allowedCodes.length === 0) return [];
 
-				var filterFieldsByCodes = function (fieldsList, allowedCodes) {
+        var allowedSet = normalizeAllowedSet(allowedCodes);
 
-					// Admin -> keep all
-					if (allowedCodes === '*') return fieldsList;
+        return fieldsList.filter(function (f) {
+            var normId = normalizeFieldCode(getFieldId(f));
+            return !!allowedSet[normId];
+        });
+    };
 
-					if (!Array.isArray(fieldsList)) return [];
+    // Final fulfill (single place)
+    var fulfillWithFields = function (fieldsList) {
 
-					// STRICT: empty intersection => show nothing
-					if (!Array.isArray(allowedCodes) || allowedCodes.length === 0) return [];
+        var list = Array.isArray(fieldsList) ? fieldsList.slice() : [];
 
-					var allowedSet = normalizeAllowedSet(allowedCodes);
+        var getVisibleTitle = function (f) {
+            if (!f || typeof f !== 'object') return '';
+            return String(
+                f.LABEL ??
+                f.NAME ??
+                f.TITLE ??
+                f.CAPTION ??
+                f.ID ??
+                ''
+            ).trim();
+        };
 
-					return fieldsList.filter(function (f) {
-						var normId = normalizeFieldCode(getFieldId(f));
-						return !!allowedSet[normId];
-					});
-				};
+        // Sort alphabetically (German locale-friendly)
+        list.sort(function (a, b) {
+            return getVisibleTitle(a).localeCompare(getVisibleTitle(b), 'de', {
+                sensitivity: 'base',
+                numeric: true,
+            });
+        });
 
-				// Final fulfill (single place)
-				var fulfillWithFields = function (fieldsList) {
+        var count = list.length;
 
-					var list = Array.isArray(fieldsList) ? fieldsList.slice() : [];
+        p.fulfill(
+            this.getPopupContent(
+                this.settings.classPopupFieldList,
+                this.getFieldListContainerClassName(count),
+                this.prepareFieldsDecl(list)
+            )
+        );
 
-					var getVisibleTitle = function (f) {
-						if (!f || typeof f !== 'object') return '';
-						return String(
-							f.LABEL ??
-							f.NAME ??
-							f.TITLE ??
-							f.CAPTION ??
-							f.ID ??
-							''
-						).trim();
-					};
+    }.bind(this);
 
-					// Sort alphabetically (German locale-friendly)
-					list.sort(function (a, b) {
-						return getVisibleTitle(a).localeCompare(getVisibleTitle(b), 'de', {
-							sensitivity: 'base',
-							numeric: true,
-						});
-					});
+    // ---------- main logic ----------
+    // Case 1: LAZY_LOAD enabled -> load fields first, then compare/filter
+    if (this.getParam('LAZY_LOAD')) {
 
-					var count = list.length;
+        var callback = function (response) {
+            var loadedFields = Array.isArray(response) ? response : [];
 
-					p.fulfill(
-						this.getPopupContent(
-							this.settings.classPopupFieldList,
-							this.getFieldListContainerClassName(count),
-							this.prepareFieldsDecl(list)
-						)
-					);
+            loadIntersectionCodesFromServer(loadedFields).then(function (allowedCodes) {
+                var finalFields = filterFieldsByCodes(loadedFields, allowedCodes);
+                fulfillWithFields(finalFields);
+            });
 
-				}.bind(this);
+        }.bind(this);
 
-				// ---------- main logic ----------
-				// Case 1: LAZY_LOAD enabled -> load fields first, then compare/filter
-				if (this.getParam('LAZY_LOAD')) {
+        if (BX.type.isNotEmptyObject(this.getParam('LAZY_LOAD')['CONTROLLER'])) {
 
-					var callback = function (response) {
-						var loadedFields = Array.isArray(response) ? response : [];
+            var sourceComponentName = this.getParam('LAZY_LOAD')['CONTROLLER']['componentName'];
+            var sourceComponentSignedParameters = this.getParam('LAZY_LOAD')['CONTROLLER']['signedParameters'];
 
-						loadIntersectionCodesFromServer(loadedFields).then(function (allowedCodes) {
-							var finalFields = filterFieldsByCodes(loadedFields, allowedCodes);
-							fulfillWithFields(finalFields);
-						});
+            BX.ajax.runAction(this.getParam('LAZY_LOAD')['CONTROLLER']['getList'], {
+                data: {
+                    filterId: this.getParam('FILTER_ID'),
+                    componentName: BX.type.isNotEmptyString(sourceComponentName) ? sourceComponentName : '',
+                    signedParameters: BX.type.isNotEmptyString(sourceComponentSignedParameters) ? sourceComponentSignedParameters : ''
+                }
+            }).then(function (response) {
+                callback(response.data);
+            }.bind(this), function () {
+                // fail -> strict hide all
+                fulfillWithFields([]);
+            });
 
-					}.bind(this);
+        } else {
 
-					if (BX.type.isNotEmptyObject(this.getParam('LAZY_LOAD')['CONTROLLER'])) {
+            this.getLazyLoadFields().then(function (res) {
+                callback(res);
+            });
 
-						var sourceComponentName = this.getParam('LAZY_LOAD')['CONTROLLER']['componentName'];
-						var sourceComponentSignedParameters = this.getParam('LAZY_LOAD')['CONTROLLER']['signedParameters'];
+        }
 
-						BX.ajax.runAction(this.getParam('LAZY_LOAD')['CONTROLLER']['getList'], {
-							data: {
-								filterId: this.getParam('FILTER_ID'),
-								componentName: BX.type.isNotEmptyString(sourceComponentName) ? sourceComponentName : '',
-								signedParameters: BX.type.isNotEmptyString(sourceComponentSignedParameters) ? sourceComponentSignedParameters : ''
-							}
-						}).then(function (response) {
-							callback(response.data);
-						}.bind(this), function () {
-							// fail -> strict hide all
-							fulfillWithFields([]);
-						});
+        return p;
+    }
 
-					} else {
+    // Case 2: non-lazy -> compare/filter already available fields
+    loadIntersectionCodesFromServer(fields).then(function (allowedCodes) {
+        var finalFields = filterFieldsByCodes(fields, allowedCodes);
+        fulfillWithFields(finalFields);
+    });
 
-						this.getLazyLoadFields().then(function (res) {
-							callback(res);
-						});
-
-					}
-
-					return p;
-				}
-
-				// Case 2: non-lazy -> compare/filter already available fields
-				loadIntersectionCodesFromServer(fields).then(function (allowedCodes) {
-					var finalFields = filterFieldsByCodes(fields, allowedCodes);
-					fulfillWithFields(finalFields);
-				});
-
-				return p;
-			},
+    return p;
+},

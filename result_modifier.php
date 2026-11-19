@@ -1,5 +1,5 @@
 <?php
-//task#49999
+// CRM grid field visibility customization.
 use Bitrix\Main\Loader;
 use Bitrix\Main\Application;
 use Bitrix\UI\Form\EntityEditorConfiguration;
@@ -32,7 +32,7 @@ Loader::includeModule('intranet');
 // Logging (readable, multiline)
 // -----------------------------------------------------
 $logFile = $_SERVER['DOCUMENT_ROOT'] . '/local/logs/field-settings-log.txt';
-$ENABLE_LOG = true;
+$ENABLE_LOG = false;
 
 if ($ENABLE_LOG) {
     $dir = dirname($logFile);
@@ -263,7 +263,7 @@ $unserializeValue = static function($value) {
     $value = (string)$value;
 
     // suppress warnings on bad data
-    $tmp = @unserialize($value);
+    $tmp = @unserialize($value, ['allowed_classes' => false]);
     if (is_array($tmp)) {
         return $tmp;
     }

@@ -23,6 +23,8 @@ Loader::includeModule('intranet');
  */
 final class LinxysFilterFieldsAjax
 {
+    private const ENABLE_LOGGING = false;
+
     private static string $logFile;
 
     // =========================================================
@@ -31,6 +33,10 @@ final class LinxysFilterFieldsAjax
     public static function run(): void
     {
         self::init();
+
+        if (!check_bitrix_sessid()) {
+            self::json(['success' => false, 'error' => 'Invalid session']);
+        }
 
         $start = microtime(true);
 
@@ -43,7 +49,6 @@ final class LinxysFilterFieldsAjax
         try {
             $payload = self::readPayload();
 
-            //$payload['filterId'] = 'crm-type-item-list-161'; //test only
 
             self::log('=== START ===', [
                 'userId'       => $payload['userId'],
@@ -82,7 +87,6 @@ final class LinxysFilterFieldsAjax
             // Pass #1: run with given filterId
             // ---------------------------------------------------------
             $result = self::runOnce($payload);
-            $payload['filterId'] = 'crm-type-item-list-161';
             // ---------------------------------------------------------
             // Extra fallback:
             // if filterId empty AND result is empty_config -> try to find any user grid in b_user_option and rerun once
@@ -212,12 +216,16 @@ final class LinxysFilterFieldsAjax
     private static function init(): void
     {
         self::$logFile = $_SERVER['DOCUMENT_ROOT'] . '/local/logs/filter_debug.log';
-        self::ensureLogDir();
+        if (self::ENABLE_LOGGING) {
+            self::ensureLogDir();
+        }
     }
 
     private static function readPayload(): array
     {
-        $userId       = (int)($_POST['user_id'] ?? 0);
+        global $USER;
+
+        $userId = is_object($USER) && $USER->IsAuthorized() ? (int)$USER->GetID() : 0;
         $entityTypeId = (int)($_POST['entityTypeId'] ?? 0);
 
         // We use ONLY filterId now (no categoryId from JS)
@@ -1053,6 +1061,10 @@ final class LinxysFilterFieldsAjax
 
     private static function log(string $label, $data = null): void
     {
+        if (!self::ENABLE_LOGGING) {
+            return;
+        }
+
         $line = date('c') . ' | ' . $label;
         if ($data !== null) {
             $line .= ' | ' . (is_string($data) ? $data : print_r($data, true));
