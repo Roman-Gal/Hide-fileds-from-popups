@@ -1,5 +1,25 @@
-			// task#49999
-			getFieldsListPopupContentLinxys: function getFieldsListPopupContentLinxys() {
+/**
+ * Object method fragment for the Bitrix popup component.
+ * The host supplies getParam, popup rendering helpers, and the BX runtime.
+ * Both lazy and preloaded field lists pass through the same allowed-code filter.
+ */
+		// task#49999
+		getFieldsListPopupContentLinxys: function getFieldsListPopupContentLinxys() {
+
+			var p = new BX.Promise();
+			var fields = this.getParam('FIELDS');
+			console.log('this', this); //test
+			// ---------- helpers ----------
+			var getEntityInfoFromUrl = function () {
+				var path = (location.pathname || '').toLowerCase();
+
+				// SPA
+				var entityTypeId = parseInt((path.match(/\/type\/(\d+)/) || [])[1] || 0, 10);
+				var categoryId   = parseInt((path.match(/\/category\/(\d+)/) || [])[1] || 0, 10);
+
+				if (entityTypeId > 0) {
+					return { entityTypeId: entityTypeId, categoryId: categoryId };
+				}
 
 				var p = new BX.Promise();
 				var fields = this.getParam('FIELDS');
